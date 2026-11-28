@@ -372,6 +372,9 @@ An `Err(..)` counts only where its value leaves the fn:
 * The fn's tail expression, a `return` value, or the operand of `?`.
 * Inside any of these: a block's tail, an `if` or `else` branch, a `match` arm, and a `select!` arm.
 * An argument that a value method may return, such as the `Err(..)` of `.map_or(Err(..), ..)`.
+* The value and the `return` values of a closure that runs in place, such as the closure of
+  `std::thread::scope(..)`, when the call is in a return position. See [Closures, async blocks and
+  nested items](#closures-async-blocks-and-nested-items).
 
 An `Err(..)` passed to a function, compared, asserted or matched against is not returned:
 
@@ -598,6 +601,11 @@ conversion. Each forwarded function needs a Forwards bullet.
 * `call()?` and `call().await?`, for fn calls and method calls.
 * A call in a return position: the tail expression, or `return call()`.
 * A binding of a call that is returned later: `let result = call(); result?`, or a tail `result`.
+  `.map_err(..)`, `.context(..)`, `.with_context(..)` and the methods below that keep the receiver's
+  error are peeled first, so `let result = call().context(..); result?` forwards `call`.
+* A call of a closure bound with `let`, which forwards the call in the closure's value, after the
+  same peeling. So `let create = |d| create_dir_all(d).context(".."); create(a)?` forwards
+  `create_dir_all`.
 * A `match` arm or an `if let` that passes the error on, as the `match` on `self.start(..)` below
   does.
 * `.map_err(Into::into)`, `.map_err(From::from)` and `.map_err(Type::from)`.
@@ -703,7 +711,8 @@ fn run(&self, job: Job) -> Result<(), Error> {
 ### Closures, async blocks and nested items
 
 A `?` inside a closure, an `async` block or a `try` block belongs to that closure or block, not to
-the fn. Nested fn items are checked on their own. So none of these is a forward of the fn:
+the fn, unless the closure runs in place, as described below. Nested fn items are checked on their
+own. So none of these is a forward of the fn:
 
 ```rust
 /// Queues the upload.
@@ -753,7 +762,62 @@ example.rs:10:5: DOC002 errors-doc: `run` forwards errors from `retry`, whose cl
 
 A call that gets a closure or a fn path is also documented by a Forwards bullet for the function the
 closure calls. So `call_with_retry(cfg, || async move { client.start_job(req).await })` is
-documented by ``Forwards [`Client::start_job`]'s return values on failure.``
+documented by ``Forwards [`Client::start_job`]'s return values on failure.`` The closure's value is
+peeled as in [What forwards](#what-forwards), so `call_with_retry(cfg, || start(r).context(".."))`
+is documented by a Forwards bullet for `start`.
+
+A closure that runs in place is part of the fn when the call's value leaves the fn, in a return
+position. Its value is the call's value, so its `?` sites, `return`s, anyhow macros and value are
+checked as the fn's own. Its value and `return` values leave the fn where the call does, so a `?`
+after the call converts them with `From`, as it converts the call's value. Two kinds of closures run
+in place, unless the closure is `async` or its body is an `async` block:
+
+* The only argument of a fn whose last segment is `scope` or `block_in_place`, such as
+  `std::thread::scope(|scope| ..)` and `tokio::task::block_in_place(|| ..)`.
+* A closure called on the spot, `(|| ..)()`.
+
+The call has no errors of its own, so a
+``Forwards [`std::thread::scope`]'s return values on failure.`` bullet is reported as stale, and
+the closure's callees are asked for instead.
+
+The `?` sites of closures passed to `std::thread::spawn`, `tokio::spawn`, `scope.spawn(..)` and
+other functions that run them elsewhere stay the closure's. So do those of a closure called on the
+spot whose result the fn handles, as the `cleanup` below:
+
+```rust
+/// Runs the job.
+///
+/// # Errors
+///
+/// Returns an error if:
+///
+/// * Forwards [`load`]'s return values on failure.
+fn run(&self, job: Job) -> Result<(), Error> {
+    let handle = std::thread::spawn(move || notify(&job.id));
+    std::thread::scope(|scope| {
+        scope.spawn(|| flush(&job));
+        load(&job)?;
+        store(&job)
+    })?;
+    let cleanup = (|| {
+        remove(&job)?;
+        Ok::<(), Error>(())
+    })();
+    if let Err(error) = cleanup {
+        warn(error);
+    }
+    (|| {
+        compress(&job)?;
+        Ok(())
+    })()
+}
+```
+
+```console
+$ yscope-linter example.rs
+example.rs:14:7: DOC002 errors-doc: `run` forwards errors from `store`, but `# Errors` does not list it; add "* Forwards [`store`]'s return values on failure."
+example.rs:23:23: DOC002 errors-doc: `run` forwards errors from `compress`, but `# Errors` does not list it; add "* Forwards [`compress`]'s return values on failure."
+```
 
 ### Spawned tasks and other opaque sources
 
@@ -869,6 +933,12 @@ example.rs:17:15: DOC002 errors-doc: `submit` forwards errors from `Self::submit
 
 Without the inherent impl of `Client` in the file, the fn passes, with or without a bullet for
 `Client::submit`.
+
+The same holds for the call in a closure that runs in place, such as
+`std::thread::scope(|_| Self::submit(self))`, and under an adaptor that passes the error on, such as
+`.map_err(Into::into)`. Under `.context(..)`, `.with_context(..)` or a `.map_err(..)` that builds
+errors, the mapped errors leave the fn whether or not the call is recursion. So the fn needs a bullet
+for them or the Forwards bullet, as in [Mapped errors](#mapped-errors).
 
 ## How calls and errors are matched to bullets
 
@@ -1245,6 +1315,27 @@ The rule reads syntax, not types. These cases are known to be wrong or incomplet
 * A callable argument named by an unqualified path that the file doesn't declare, such as
   `execute(cfg, imported_fn)`, isn't a spelling of the call. Forward `execute`.
 * Return types are recognized by name only. An alias that doesn't end with `Result` isn't checked.
+* A bound closure or call that ends in `.context(..)`, `.with_context(..)` or `.map_err(..)`,
+  such as `let create = |d| create_dir_all(d).context(".."); create(a)?`, needs a Forwards bullet
+  for the receiver's callee. A bullet for `anyhow::Error`, or for the variants the mapper builds,
+  doesn't document it.
+* A call of a closure bound with `let` forwards only the callee of the closure's value. The `?`
+  sites, `return Err(..)`s and anyhow macros of its body aren't required, and a call whose result
+  the fn handles adds nothing: only calls in a return position do. So after
+  `let attempt = |x| { load(x)?; store(x) };`, `if attempt(1).is_err() { .. }` requires nothing,
+  and `attempt(2)?` requires `store` only.
+  [y-scope/yscope-linter#22](https://github.com/y-scope/yscope-linter/issues/22) tracks checking the
+  body at those calls, as for in-place closures.
+* A closure that runs in place keeps its `?` sites and `return`s to itself, and their errors aren't
+  required, when its call isn't itself in a return position. Examples:
+  * Its result is bound with `let` and returned later: `let result = (|| ..)(); result?`.
+  * Its call is under `.context(..)`, `.with_context(..)` or `.map_err(..)`, as in
+    `(|| ..)().context(..)?`. Only the call in the closure's value is required.
+* Any fn whose last segment is `scope` or `block_in_place` and whose only argument is a closure is
+  treated as running it in place.
+* A `let` inside a closure replaces an outer binding of the same name for the rest of the fn. So in
+  `let result = load(); std::thread::scope(|_| { result?; let result = store(); result })` at the
+  fn's tail, `result?` is taken as a forward of `store`, and `load` isn't required.
 * When the rule skips test code, out-of-line `#[cfg(test)]` modules declared with `#[path]`, or
   inside an inline module of the parent, are checked as non-test code.
 * A trait impl method's same-name call through `Self::`, its type or `self.` is matched to an

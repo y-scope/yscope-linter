@@ -82,6 +82,11 @@ pub const BUILDER_KEEPING_METHODS: [&str; 2] = ["bind", "persistent"];
 /// into an unknown variant of the fn's error type.
 pub const SPAWN_FNS: [&str; 2] = ["spawn", "spawn_blocking"];
 
+/// Fns that run their only argument, a closure, before they return, and return its value, such as
+/// `std::thread::scope(|scope| ..)`. A member's closure is part of the fn when the call's value
+/// leaves the fn.
+pub const IN_PLACE_FNS: [&str; 2] = ["scope", "block_in_place"];
+
 /// The traits whose implementors a fn may call or await to get a result. A parameter bounded by a
 /// member is a callable parameter.
 pub const CALLABLE_TRAITS: [&str; 8] = [

@@ -1739,4 +1739,243 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn documented_forwards_through_adaptor_closures_are_clean() {
+        let source_text = concat!(
+            "use anyhow::Context;\n",
+            "\n",
+            "/// Creates the directories.\n",
+            "///\n",
+            "/// # Errors\n",
+            "///\n",
+            "/// Returns an error if:\n",
+            "///\n",
+            "/// * Forwards [`std::fs::create_dir_all`]'s return values on failure.\n",
+            "fn create(a: &std::path::Path, b: &std::path::Path) -> anyhow::Result<()> {\n",
+            "    let create_directory = |directory: &std::path::Path| {\n",
+            "        std::fs::create_dir_all(directory)\n",
+            "            .context(\"failed to create the directory\")\n",
+            "    };\n",
+            "    create_directory(a)?;\n",
+            "    create_directory(b)\n",
+            "}\n",
+        );
+        assert_eq!(checked(source_text), Vec::<String>::new());
+    }
+
+    #[test]
+    fn documented_forwards_through_thread_scopes_are_clean() {
+        let source_text = concat!(
+            "use anyhow::Context;\n",
+            "\n",
+            "/// Runs the command in a thread scope.\n",
+            "///\n",
+            "/// # Errors\n",
+            "///\n",
+            "/// Returns an error if:\n",
+            "///\n",
+            "/// * Forwards [`std::process::Command::spawn`]'s return values on failure.\n",
+            "fn run(command: &mut std::process::Command) -> anyhow::Result<()> {\n",
+            "    std::thread::scope(|_scope| {\n",
+            "        let child = command.spawn().context(\"failed to spawn\")?;\n",
+            "        drop(child);\n",
+            "        let result: anyhow::Result<()> = Ok(());\n",
+            "        result.context(\"failed to run\")\n",
+            "    })\n",
+            "}\n",
+        );
+        assert_eq!(checked(source_text), Vec::<String>::new());
+    }
+
+    #[test]
+    fn in_place_closure_question_marks_need_bullets() {
+        let source_text = subject(
+            &["Forwards [`store`]'s return values on failure."],
+            "    std::thread::scope(|_scope| {\n        load()?;\n        store()\n    })",
+        );
+        assert_eq!(
+            checked(&source_text),
+            [
+                "10:15: `subject` forwards errors from `load`, but `# Errors` does not list it; \
+                 add \"* Forwards [`load`]'s return values on failure.\""
+            ]
+        );
+    }
+
+    #[test]
+    fn returns_from_closures_called_on_the_spot_convert_at_the_call_site() {
+        let source_text = concat!(
+            "enum Outer { Inner(Inner) }\n",
+            "impl From<Inner> for Outer {\n",
+            "    fn from(inner: Inner) -> Self { Self::Inner(inner) }\n",
+            "}\n",
+            "/// Checks.\n",
+            "///\n",
+            "/// # Errors\n",
+            "///\n",
+            "/// Returns an error if:\n",
+            "///\n",
+            "/// * [`Outer::Inner`] if `x` is set.\n",
+            "fn subject(x: bool) -> Result<(), Outer> {\n",
+            "    (|| -> Result<(), Inner> {\n",
+            "        if x { return Err(Inner::A); }\n",
+            "        Ok(())\n",
+            "    })()?;\n",
+            "    Ok(())\n",
+            "}\n",
+        );
+        assert_eq!(checked(source_text), Vec::<String>::new());
+    }
+
+    #[test]
+    fn wraps_in_in_place_closures_convert_at_the_call_site() {
+        let source_text = concat!(
+            "enum Outer { Inner(Inner) }\n",
+            "impl From<Inner> for Outer {\n",
+            "    fn from(inner: Inner) -> Self { Self::Inner(inner) }\n",
+            "}\n",
+            "/// Checks.\n",
+            "///\n",
+            "/// # Errors\n",
+            "///\n",
+            "/// Returns an error if:\n",
+            "///\n",
+            "/// * [`Outer::Inner`] if loading fails.\n",
+            "fn wrapped_match() -> Result<(), Outer> {\n",
+            "    std::thread::scope(|_| -> Result<(), Inner> {\n",
+            "        match load() {\n",
+            "            Ok(()) => Ok(()),\n",
+            "            Err(error) => Err(Inner::Wrap(error)),\n",
+            "        }\n",
+            "    })?;\n",
+            "    Ok(())\n",
+            "}\n",
+            "/// Checks.\n",
+            "///\n",
+            "/// # Errors\n",
+            "///\n",
+            "/// Returns an error if:\n",
+            "///\n",
+            "/// * [`Outer::Inner`] if loading fails.\n",
+            "fn wrapped_if_let() -> Result<(), Outer> {\n",
+            "    (|| -> Result<(), Inner> {\n",
+            "        if let Err(error) = load() { return Err(Inner::Wrap(error)); }\n",
+            "        Ok(())\n",
+            "    })()?;\n",
+            "    Ok(())\n",
+            "}\n",
+        );
+        assert_eq!(checked(source_text), Vec::<String>::new());
+    }
+
+    #[test]
+    fn same_name_self_calls_in_trait_impls_compose_with_error_adaptors_and_in_place_closures() {
+        let trait_impl = |bullet: &str, call: &str| {
+            let head = concat!(
+                "impl Submitter for Client {\n",
+                "    /// # Errors\n",
+                "    ///\n",
+                "    /// Returns an error if:\n",
+            );
+            let signature = "    fn submit(&self) -> Result<(), Error> {\n";
+            format!("{head}{bullet}{signature}        Ok({call}?)\n    }}\n}}\n")
+        };
+        let bullet_of = |text: &str| format!("    ///\n    /// * {text}\n");
+        let forwards_bullet =
+            |path: &str| bullet_of(&format!("Forwards [`{path}`]'s return values on failure."));
+        for call in [
+            "self.submit().map_err(Into::into)",
+            "std::thread::scope(|_| Self::submit(self))",
+            "(|| self.submit())()",
+        ] {
+            for optional_bullet in [
+                forwards_bullet("Client::submit"),
+                forwards_bullet("Self::submit"),
+                String::new(),
+            ] {
+                assert_eq!(
+                    all_findings(&trait_impl(&optional_bullet, call)),
+                    Vec::<String>::new(),
+                    "`{call}` with bullet `{optional_bullet}`"
+                );
+            }
+            assert_eq!(
+                checked(&trait_impl(&forwards_bullet("Other::submit"), call)),
+                [
+                    "6:5: \"Forwards [`Other::submit`]\" names a function whose errors `submit` \
+                     never forwards"
+                ],
+                "`{call}`"
+            );
+        }
+        for (call, error, column) in [
+            ("Self::submit(self).context(\"c\")", "anyhow::Error", 43),
+            (
+                "std::thread::scope(|_| self.submit().map_err(Error::Wrap))",
+                "Error::Wrap",
+                70,
+            ),
+        ] {
+            for bullet in [
+                forwards_bullet("Client::submit"),
+                forwards_bullet("Self::submit"),
+                bullet_of(&format!("[`{error}`] if submitting fails.")),
+            ] {
+                assert_eq!(
+                    checked(&trait_impl(&bullet, call)),
+                    Vec::<String>::new(),
+                    "`{call}` with bullet `{bullet}`"
+                );
+            }
+            assert_eq!(
+                checked(&trait_impl("", call)),
+                [format!(
+                    "6:{column}: `submit` maps errors from `Self::submit` into [`{error}`], but \
+                     `# Errors` documents neither; add \"* Forwards [`Self::submit`]'s return \
+                     values on failure.\" or \"* [`{error}`] if ...\""
+                )],
+                "`{call}`"
+            );
+        }
+    }
+
+    #[test]
+    fn let_closures_contribute_only_from_calls_in_a_return_position() {
+        let handled_closure = concat!(
+            "    let inner = |x: u32| -> anyhow::Result<()> {\n",
+            "        load(x)?;\n",
+            "        store(x)\n",
+            "    };\n",
+            "    if inner(1).is_err() {\n",
+            "        tracing::warn!(\"first attempt failed\");\n",
+            "    }\n",
+        );
+        let store_bullet = "Forwards [`store`]'s return values on failure.";
+        let other_bullet = "Forwards [`other`]'s return values on failure.";
+        assert_eq!(
+            checked(&subject(
+                &[store_bullet],
+                &format!("{handled_closure}    inner(2)?;\n    Ok(())")
+            )),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            checked(&subject(
+                &[other_bullet],
+                &format!("{handled_closure}    inner(2)?;\n    other()")
+            )),
+            [
+                "16:13: `subject` forwards errors from `store`, but `# Errors` does not list it; \
+                 add \"* Forwards [`store`]'s return values on failure.\""
+            ]
+        );
+        assert_eq!(
+            checked(&subject(
+                &[other_bullet],
+                &format!("{handled_closure}    other()")
+            )),
+            Vec::<String>::new()
+        );
+    }
 }

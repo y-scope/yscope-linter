@@ -217,6 +217,7 @@ pub fn scan<'ast>(fn_item: &FnItem<'ast>, file_index: &FileIndex<'ast>) -> BodyF
         builder_bindings: HashMap::new(),
         forwarded_sites: HashSet::new(),
         err_binding_callees: HashMap::new(),
+        in_place_return_site: None,
         facts: BodyFacts::default(),
     };
     if let Some(block) = fn_item.block {
@@ -349,6 +350,16 @@ struct ClosureBinding {
     tail_callee: Option<Callee>,
 }
 
+/// The bindings of one name, as [`BodyScanner`] keeps them.
+struct NameBindings {
+    closure: Option<ClosureBinding>,
+    error: Option<ErrorSet>,
+    call: Option<Callee>,
+    is_spawned: bool,
+    builder: Option<&'static str>,
+    err_binding_callee: Option<Callee>,
+}
+
 /// How a `map_err` argument transforms an error.
 enum Mapper {
     /// `Into::into`, `From::from`, `X::from`, or a closure returning its parameter converted.
@@ -428,6 +439,10 @@ struct BodyScanner<'context, 'ast> {
     /// `if let` branches binds, by binding name, such as `foo` for `e` in `Err(e) => ..` of
     /// `match foo()`.
     err_binding_callees: HashMap<String, Callee>,
+
+    /// The site where the value of the in-place closure being visited leaves the fn, if any.
+    /// `return`s in its body leave the fn there too.
+    in_place_return_site: Option<Site>,
 
     facts: BodyFacts,
 }
@@ -571,6 +586,8 @@ impl<'ast> BodyScanner<'_, 'ast> {
     /// * A conversion such as `x.into()` is classified through `x`. A converted value that isn't a
     ///   call is an opaque source.
     /// * `Err(..)` returns its argument's errors directly, and `Ok(..)` and `Some(..)` return none.
+    /// * A call that runs a closure in place, as [`in_place_closure`] finds it, is classified by
+    ///   [`Self::classify_in_place_closure`].
     /// * The sink fns, such as `try_join_all(..)`, are classified through the items of their
     ///   argument, as [`Self::classify_produced_items`] describes.
     /// * Other calls forward their callee, which [`Self::record_forward`] records. A call whose
@@ -607,6 +624,8 @@ impl<'ast> BodyScanner<'_, 'ast> {
                 if is_err_call(call) {
                     self.record_err_call(call, site);
                 } else if is_ok_or_some_call(call) {
+                } else if let Some(closure) = in_place_closure(call) {
+                    self.classify_in_place_closure(closure, site);
                 } else if call_path_last(call)
                     .is_some_and(|last| known_apis::SINK_FNS.contains(&last.as_str()))
                 {
@@ -686,6 +705,19 @@ impl<'ast> BodyScanner<'_, 'ast> {
         }
     }
 
+    /// Classifies a closure that a call runs in place, whose value is the call's value and leaves
+    /// the fn at `site`. The closure's body is visited at the current depth, so its `?`, `return`
+    /// and anyhow-macro sites leave the fn too, and its value and `return` values are classified at
+    /// `site`.
+    fn classify_in_place_closure(&mut self, closure: &syn::ExprClosure, site: Site) {
+        self.with_hidden_bindings(closure_parameters(closure), |body_scanner| {
+            let outer_return_site = body_scanner.in_place_return_site.replace(site);
+            body_scanner.visit_expr(&closure.body);
+            body_scanner.classify_fallible(&closure.body, site);
+            body_scanner.in_place_return_site = outer_return_site;
+        });
+    }
+
     /// Classifies a macro whose value leaves the fn at `site`:
     ///
     /// * The arm bodies of a `select!` are classified as the macro's value.
@@ -763,18 +795,16 @@ impl<'ast> BodyScanner<'_, 'ast> {
                 self.record_error_set(error_set, method_position, site.is_try());
             }
             "map_err" => self.classify_map_err(method_call, site),
-            "context" | "with_context" => {
-                match self.callee_of(peel_pass_through(&method_call.receiver)) {
-                    Some(callee) => self.record(
-                        ObligationKind::Either {
-                            callee: callee.spellings,
-                            errors: vec![anyhow_error_spellings()],
-                        },
-                        site.position_or(callee.position),
-                    ),
-                    None => self.record_opaque_source(),
-                }
-            }
+            "context" | "with_context" => match self.callee_of(&method_call.receiver) {
+                Some(callee) => self.record(
+                    ObligationKind::Either {
+                        callee: callee.spellings,
+                        errors: vec![anyhow_error_spellings()],
+                    },
+                    site.position_or(callee.position),
+                ),
+                None => self.record_opaque_source(),
+            },
             "and_then" => {
                 self.classify_fallible(&method_call.receiver, site);
                 self.classify_chained_fn(method_call.args.first(), site);
@@ -840,7 +870,7 @@ impl<'ast> BodyScanner<'_, 'ast> {
     /// * Without a callee (the receiver is a variable), constructed errors are returned directly, a
     ///   conversion is an opaque source, and an unknown mapper is an opaque error.
     fn classify_map_err(&mut self, method_call: &syn::ExprMethodCall, site: Site) {
-        let callee = self.callee_of(peel_pass_through(&method_call.receiver));
+        let callee = self.callee_of(&method_call.receiver);
         let mapper = method_call.args.first().map_or_else(
             || Mapper::Unknown {
                 description: "an unparsable mapper".to_owned(),
@@ -903,8 +933,11 @@ impl<'ast> BodyScanner<'_, 'ast> {
         }
     }
 
-    /// Finds the callee of a call or method call, after peeling `.await` and parentheses.
+    /// Finds the callee of a call or method call, after peeling `.await`, parentheses and the
+    /// adaptors that [`peel_error_adaptors`] peels.
     ///
+    /// * The receiver of an adaptor gives the callee, so `load(key).context(..)` and
+    ///   `load(key).map_err(Error::Wrap)` give the callee of `load`.
     /// * A call to a path gives the callee of [`Self::path_callee`].
     /// * A method call gives its method name. On a query builder that [`Self::builder_type`] names,
     ///   the name is qualified by the builder's type, such as `QueryAs::fetch_all`. The earlier
@@ -914,15 +947,21 @@ impl<'ast> BodyScanner<'_, 'ast> {
     ///   recursive `self.name(..)` call, as [`Self::self_call_recursion`] decides, is spelled
     ///   `Self::name` instead.
     /// * `block_on(x)` and `.block_on(x)` give the callee of `x`.
+    /// * A call that runs a closure in place, as [`in_place_closure`] finds it, gives the callee of
+    ///   the closure's value, so `std::thread::scope(|_| load())` gives the callee of `load`.
     /// * A call that passes callables is completed by [`Self::with_callable_args`].
     ///
     /// # Returns
     ///
     /// The callee, or [`None`] if `expr` isn't a call, calls something other than a path (such as a
-    /// field), or calls a value method such as `.expect(..)`.
+    /// field), calls a value method such as `.expect(..)`, or runs a closure in place whose value
+    /// has no callee.
     fn callee_of(&self, expr: &syn::Expr) -> Option<Callee> {
-        match peel_await_and_parens(expr) {
+        match peel_error_adaptors(expr) {
             syn::Expr::Call(call) => {
+                if let Some(closure) = in_place_closure(call) {
+                    return self.callee_of(peel_block_tail(&closure.body));
+                }
                 let syn::Expr::Path(expr_path) = peel_parens(&call.func) else {
                     return None;
                 };
@@ -1683,7 +1722,7 @@ impl<'ast> BodyScanner<'_, 'ast> {
                 .and_then(|ident| self.err_binding_callees.get(&ident.to_string()))
                 .cloned();
             match callee {
-                Some(callee) => self.record_forward(callee, Site::Tail),
+                Some(callee) => self.record_forward(callee, self.return_site()),
                 None => self.record_opaque_source(),
             }
         }
@@ -1703,7 +1742,7 @@ impl<'ast> BodyScanner<'_, 'ast> {
         if !is_call(scrutinee) {
             return None;
         }
-        let callee = self.callee_of(peel_pass_through(scrutinee))?;
+        let callee = self.callee_of(scrutinee)?;
         Some((binding, callee))
     }
 
@@ -1738,6 +1777,55 @@ impl<'ast> BodyScanner<'_, 'ast> {
                 Some(callee) => self.err_binding_callees.insert(binding, callee),
                 None => self.err_binding_callees.remove(&binding),
             };
+        }
+    }
+
+    /// Runs `visit` with the bindings of `names` hidden, and restores them afterwards.
+    fn with_hidden_bindings(&mut self, names: Vec<String>, visit: impl FnOnce(&mut Self)) {
+        let hidden: Vec<(String, NameBindings)> = names
+            .into_iter()
+            .map(|name| {
+                let bindings = self.take_bindings(&name);
+                (name, bindings)
+            })
+            .collect();
+        visit(self);
+        for (name, bindings) in hidden {
+            self.restore_bindings(name, bindings);
+        }
+    }
+
+    /// Removes the bindings of `name`.
+    ///
+    /// # Returns
+    ///
+    /// The removed bindings.
+    fn take_bindings(&mut self, name: &str) -> NameBindings {
+        NameBindings {
+            closure: self.closure_bindings.remove(name),
+            error: self.error_bindings.remove(name),
+            call: self.call_bindings.remove(name),
+            is_spawned: self.spawned_bindings.remove(name),
+            builder: self.builder_bindings.remove(name),
+            err_binding_callee: self.err_binding_callees.remove(name),
+        }
+    }
+
+    /// Replaces the bindings of `name` with `bindings`.
+    fn restore_bindings(&mut self, name: String, bindings: NameBindings) {
+        restore_binding(&mut self.closure_bindings, &name, bindings.closure);
+        restore_binding(&mut self.error_bindings, &name, bindings.error);
+        restore_binding(&mut self.call_bindings, &name, bindings.call);
+        restore_binding(&mut self.builder_bindings, &name, bindings.builder);
+        restore_binding(
+            &mut self.err_binding_callees,
+            &name,
+            bindings.err_binding_callee,
+        );
+        if bindings.is_spawned {
+            self.spawned_bindings.insert(name);
+        } else {
+            self.spawned_bindings.remove(&name);
         }
     }
 
@@ -1818,7 +1906,7 @@ impl<'ast> BodyScanner<'_, 'ast> {
                     &pat_ident.ident.to_string(),
                 )
             {
-                self.classify_fallible(&expr_match.expr, Site::Tail);
+                self.classify_fallible(&expr_match.expr, self.return_site());
             }
             if let Some(binding) = err_binding(&arm.pat) {
                 self.forward_binding(&expr_match.expr, &binding, |binding| {
@@ -1868,7 +1956,7 @@ impl<'ast> BodyScanner<'_, 'ast> {
     ) {
         if let Some(sites) = forwarded_sites(binding) {
             self.forwarded_sites.extend(sites);
-            self.classify_fallible(scrutinee, Site::Tail);
+            self.classify_fallible(scrutinee, self.return_site());
         }
     }
 
@@ -1876,7 +1964,7 @@ impl<'ast> BodyScanner<'_, 'ast> {
     /// as `Err(error) => Err(Error::Cache(error))`. The callee's error is mapped into the errors of
     /// `wrapping`, so either may be documented, and the `Err(..)` records nothing itself.
     fn wrap_binding(&mut self, scrutinee: &syn::Expr, position: Position, wrapping: &syn::Expr) {
-        let Some(callee) = self.callee_of(peel_pass_through(scrutinee)) else {
+        let Some(callee) = self.callee_of(scrutinee) else {
             return;
         };
         let Some(errors) = self.classify_error(wrapping, true).into_resolved_errors() else {
@@ -1886,17 +1974,30 @@ impl<'ast> BodyScanner<'_, 'ast> {
         self.record(
             ObligationKind::Either {
                 callee: callee.spellings,
-                errors: self.convert(errors, is_conversion(wrapping)),
+                errors: self.convert(
+                    errors,
+                    is_conversion(wrapping) || self.return_site().is_try(),
+                ),
             },
             position,
         );
     }
 
-    /// Runs `visit` inside a nested scope, where `?` doesn't leave the fn.
+    /// # Returns
+    ///
+    /// The site where a `return` value leaves the fn: the site of the in-place closure being
+    /// visited, if any, or else [`Site::Tail`].
+    fn return_site(&self) -> Site {
+        self.in_place_return_site.unwrap_or(Site::Tail)
+    }
+
+    /// Runs `visit` inside a nested scope, where `?` and `return` don't leave the fn.
     fn with_nested_scope(&mut self, visit: impl FnOnce(&mut Self)) {
+        let outer_return_site = self.in_place_return_site.take();
         self.nested_scope_depth += 1;
         visit(self);
         self.nested_scope_depth -= 1;
+        self.in_place_return_site = outer_return_site;
     }
 }
 
@@ -2006,7 +2107,7 @@ impl<'node> Visit<'node> for BodyScanner<'_, '_> {
 
     fn visit_expr_return(&mut self, expr_return: &'node syn::ExprReturn) {
         if let Some(returned) = &expr_return.expr {
-            self.classify_fallible(returned, Site::Tail);
+            self.classify_fallible(returned, self.return_site());
         }
         syn::visit::visit_expr_return(self, expr_return);
     }
@@ -2165,13 +2266,13 @@ fn peel_await_and_parens(mut expr: &syn::Expr) -> &syn::Expr {
 
 /// # Returns
 ///
-/// `expr` without `.await`, parentheses and pass-through adaptors such as `.map(..)`.
-fn peel_pass_through(mut expr: &syn::Expr) -> &syn::Expr {
+/// `expr` without `.await`, parentheses and the error adaptors that [`is_error_adaptor`] matches,
+/// such as `.map(..)` and `.context(..)`.
+fn peel_error_adaptors(mut expr: &syn::Expr) -> &syn::Expr {
     loop {
         expr = match peel_await_and_parens(expr) {
             syn::Expr::MethodCall(method_call)
-                if known_apis::PASS_THROUGH_METHODS
-                    .contains(&method_call.method.to_string().as_str()) =>
+                if is_error_adaptor(&method_call.method.to_string()) =>
             {
                 &method_call.receiver
             }
@@ -2294,12 +2395,28 @@ fn is_value_method(method: &str) -> bool {
 
 /// # Returns
 ///
-/// Whether `expr` is an awaited `spawn(..)` or `spawn_blocking(..)` call or method call.
+/// Whether `method` passes its receiver's error on, as `.map(..)` does, or maps it, as
+/// `.map_err(..)`, `.context(..)` and `.with_context(..)` do.
+fn is_error_adaptor(method: &str) -> bool {
+    matches!(method, "map_err" | "context" | "with_context")
+        || known_apis::PASS_THROUGH_METHODS.contains(&method)
+}
+
+/// # Returns
+///
+/// Whether `expr` is an awaited `spawn(..)` or `spawn_blocking(..)` call or method call, directly
+/// or as the value of a closure that runs in place, such as `(|| tokio::spawn(..))().await`.
 fn is_awaited_spawn(expr: &syn::Expr) -> bool {
-    match peel_parens(expr) {
-        syn::Expr::Await(expr_await) => is_spawn_call(&expr_await.base),
-        _ => false,
+    let syn::Expr::Await(expr_await) = peel_parens(expr) else {
+        return false;
+    };
+    let mut awaited = &*expr_await.base;
+    while let syn::Expr::Call(call) = peel_parens(awaited)
+        && let Some(closure) = in_place_closure(call)
+    {
+        awaited = peel_block_tail(&closure.body);
     }
+    is_spawn_call(awaited)
 }
 
 /// # Returns
@@ -2315,6 +2432,30 @@ fn is_spawn_call(expr: &syn::Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// # Returns
+///
+/// The closure that `call` runs in place and whose value is the call's value, or [`None`] if there
+/// is none, or if it is async or its body is an async block. A closure runs in place when it is
+/// called on the spot, such as `(|| body)()`, or is the only argument of a fn that
+/// [`known_apis::IN_PLACE_FNS`] lists.
+fn in_place_closure(call: &syn::ExprCall) -> Option<&syn::ExprClosure> {
+    let closure = match peel_parens(&call.func) {
+        syn::Expr::Closure(closure) => closure,
+        _ if call_path_last(call)
+            .is_some_and(|last| known_apis::IN_PLACE_FNS.contains(&last.as_str())) =>
+        {
+            match peel_parens(only_argument(&call.args)?) {
+                syn::Expr::Closure(closure) => closure,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let is_async = closure.asyncness.is_some()
+        || matches!(peel_block_tail(&closure.body), syn::Expr::Async(_));
+    (!is_async).then_some(closure)
 }
 
 /// # Returns
@@ -2408,6 +2549,46 @@ fn closure_parameter(closure: &syn::ExprClosure) -> Option<String> {
             Some(pat_ident.ident.to_string())
         }
         _ => None,
+    }
+}
+
+/// # Returns
+///
+/// The names that `closure`'s identifier parameter patterns bind.
+fn closure_parameters(closure: &syn::ExprClosure) -> Vec<String> {
+    closure
+        .inputs
+        .iter()
+        .filter_map(|pat| {
+            let pat = match pat {
+                syn::Pat::Type(pat_type) => &*pat_type.pat,
+                pat => pat,
+            };
+            match pat {
+                syn::Pat::Ident(pat_ident) => Some(pat_ident.ident.to_string()),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Sets the binding of `name` in `bindings` to `binding`, or removes it if `binding` is [`None`].
+///
+/// # Type Parameters
+///
+/// * `BindingType` - The type of what a binding records.
+fn restore_binding<BindingType>(
+    bindings: &mut HashMap<String, BindingType>,
+    name: &str,
+    binding: Option<BindingType>,
+) {
+    match binding {
+        Some(binding) => {
+            bindings.insert(name.to_owned(), binding);
+        }
+        None => {
+            bindings.remove(name);
+        }
     }
 }
 
@@ -2952,6 +3133,7 @@ mod tests {
     fn spawned_handles_and_converted_variables_are_opaque_errors() {
         for body in [
             "let x = tokio::task::spawn_blocking(f).await??;\nOk(())",
+            "(|| tokio::spawn(load()))().await??;\nOk(())",
             "Err(error.into())",
             "Err(Error::from(error))",
         ] {
@@ -3493,5 +3675,362 @@ mod tests {
         );
         assert_eq!(obligations_of(blanket_impl), Vec::<String>::new());
         assert_eq!(nested_callees_of(blanket_impl), Vec::<String>::new());
+    }
+
+    #[test]
+    fn closure_bindings_name_the_callee_under_error_adaptors() {
+        let source_text = subject(
+            &[
+                "let a = |k| load(k).context(\"c\");",
+                "a(1)?;",
+                "let b = |k| fetch(k).with_context(|| \"c\");",
+                "b(1)?;",
+                "let c = |k| read(k).map_err(Error::Wrap);",
+                "c(1)?;",
+                "let d = |k| open(k).inspect_err(|_| ()).map_err(Into::into);",
+                "d(1)?;",
+                "Ok(())",
+            ]
+            .join("\n"),
+        );
+        assert_eq!(
+            obligations_of(&source_text),
+            [
+                "forward load",
+                "forward fetch",
+                "forward read",
+                "forward open"
+            ]
+        );
+    }
+
+    #[test]
+    fn callable_args_name_the_callee_under_error_adaptors() {
+        let source_text = subject("call_with_retry(cfg, || start(r).context(\"c\"))?;\nOk(())");
+        assert_eq!(
+            obligations_of(&source_text),
+            ["forward start|call_with_retry"]
+        );
+    }
+
+    #[test]
+    fn call_bindings_name_the_callee_under_error_adaptors() {
+        let source_text = subject("let r = foo().context(\"c\");\nr?;\nOk(())");
+        assert_eq!(obligations_of(&source_text), ["forward foo"]);
+        let facts = facts_of(&subject("let r = x.map_err(Error::Wrap);\nr?;\nOk(())"));
+        assert_eq!(facts.obligations, []);
+        assert!(facts.has_opaque_source);
+    }
+
+    #[test]
+    fn in_place_closures_leave_the_fn_with_the_call() {
+        let source_text = subject(
+            &[
+                "std::thread::scope(|scope| {",
+                "    let child = spawn_child().context(\"c\")?;",
+                "    drop(child);",
+                "    let result: anyhow::Result<()> = Ok(());",
+                "    result.context(\"r\")",
+                "})",
+            ]
+            .join("\n"),
+        );
+        assert_eq!(
+            obligations_of(&source_text),
+            ["either spawn_child anyhow::Error"]
+        );
+        assert!(facts_of(&source_text).has_opaque_source);
+
+        let source_text = subject("tokio::task::block_in_place(|| { load()?; store() })");
+        assert_eq!(
+            obligations_of(&source_text),
+            ["forward load", "forward store"]
+        );
+        assert!(!facts_of(&source_text).has_opaque_source);
+
+        let source_text = subject("std::thread::scope(|s| { a()?; b() })?;\nOk(())");
+        assert_eq!(obligations_of(&source_text), ["forward a", "forward b"]);
+
+        let source_text = subject("let r = std::thread::scope(|_| load());\nr?;\nOk(())");
+        assert_eq!(obligations_of(&source_text), ["forward load"]);
+
+        let source_text = subject(
+            "std::thread::scope(|_| {\nif x { return Err(Error::A); }\nanyhow::ensure!(y, \
+             \"z\");\nload()\n})",
+        );
+        assert_eq!(
+            obligations_of(&source_text),
+            ["direct Error::A", "direct anyhow::Error", "forward load"]
+        );
+    }
+
+    #[test]
+    fn in_place_closure_returns_convert_at_the_call_site() {
+        let source_text = concat!(
+            "enum Outer { Inner(Inner) }\n",
+            "impl From<Inner> for Outer {\n",
+            "    fn from(inner: Inner) -> Self { Self::Inner(inner) }\n",
+            "}\n",
+            "fn subject() -> Result<(), Outer> {\n",
+            "    std::thread::scope(|_| -> Result<(), Inner> {\n",
+            "        if x { return Err(Inner::A); }\n",
+            "        Ok(())\n",
+            "    })?;\n",
+            "    Ok(())\n",
+            "}\n",
+        );
+        assert_eq!(
+            obligations_of(source_text),
+            ["direct Outer::Inner|Inner::A"]
+        );
+    }
+
+    #[test]
+    fn in_place_closure_match_arms_convert_at_the_call_site() {
+        let conversion = concat!(
+            "enum Outer { Inner(Inner) }\n",
+            "impl From<Inner> for Outer {\n",
+            "    fn from(inner: Inner) -> Self { Self::Inner(inner) }\n",
+            "}\n",
+            "fn classify(error: Inner) -> Inner { log(&error); error }\n",
+        );
+        for (body, expected) in [
+            (
+                concat!(
+                    "    std::thread::scope(|_| -> Result<(), Inner> {\n",
+                    "        match load() {\n",
+                    "            Ok(()) => Ok(()),\n",
+                    "            Err(error) => Err(Inner::Wrap(error)),\n",
+                    "        }\n",
+                    "    })?;\n",
+                ),
+                "either load Outer::Inner|Inner::Wrap",
+            ),
+            (
+                concat!(
+                    "    (|| -> Result<(), Inner> {\n",
+                    "        if let Err(error) = load() { return Err(Inner::Wrap(error)); }\n",
+                    "        Ok(())\n",
+                    "    })()?;\n",
+                ),
+                "either load Outer::Inner|Inner::Wrap",
+            ),
+            (
+                concat!(
+                    "    std::thread::scope(|_| -> Result<(), Inner> {\n",
+                    "        match retry(|| Err(Inner::A)) {\n",
+                    "            Ok(()) => Ok(()),\n",
+                    "            Err(error) => Err(error),\n",
+                    "        }\n",
+                    "    })?;\n",
+                ),
+                "higher-order retry Outer::Inner|Inner::A",
+            ),
+            (
+                concat!(
+                    "    std::thread::scope(|_| -> Result<(), Inner> {\n",
+                    "        match retry(|| Err(Inner::A)) {\n",
+                    "            Ok(()) => Ok(()),\n",
+                    "            Err(error) => Err(classify(error)),\n",
+                    "        }\n",
+                    "    })?;\n",
+                ),
+                "higher-order retry Outer::Inner|Inner::A",
+            ),
+        ] {
+            let source_text =
+                format!("{conversion}fn subject() -> Result<(), Outer> {{\n{body}    Ok(())\n}}\n");
+            assert_eq!(
+                obligations_of(&source_text),
+                [expected],
+                "obligations of `{body}`"
+            );
+        }
+    }
+
+    #[test]
+    fn closures_called_on_the_spot_leave_the_fn_only_from_a_return_position() {
+        let source_text = subject("(|| { load()?; store() })()");
+        assert_eq!(
+            obligations_of(&source_text),
+            ["forward load", "forward store"]
+        );
+
+        let source_text = subject(
+            "let r = (|| { store()?; Ok::<(), Error>(()) })();\nif let Err(e) = r { warn(e); \
+             }\nload()?;\nOk(())",
+        );
+        let facts = facts_of(&source_text);
+        assert_eq!(obligations_of(&source_text), ["forward load"]);
+        let store = SymbolPath::parse("store").expect("valid path");
+        assert!(facts.nested_callees.contains(&store));
+        assert!(!facts.has_opaque_source);
+
+        let source_text = subject("let r = (|| load())();\nr?;\nOk(())");
+        assert_eq!(obligations_of(&source_text), ["forward load"]);
+    }
+
+    #[test]
+    fn in_place_closure_parameters_shadow_outer_bindings() {
+        for body in [
+            "let r = load();\ndrop(r);\n(|r: Result<(), Error>| { r?; Ok(()) })(store())",
+            "let s = load();\ndrop(s);\nstd::thread::scope(|s| { s?; store() })",
+        ] {
+            let obligations = obligations_of(&subject(body));
+            assert!(
+                !obligations.contains(&"forward load".to_owned()),
+                "obligations of `{body}`: {obligations:?}"
+            );
+        }
+
+        let source_text =
+            subject("let r = load();\n(|r: Result<(), Error>| { r?; Ok(()) })(store())?;\nr");
+        assert_eq!(obligations_of(&source_text), ["forward load"]);
+    }
+
+    #[test]
+    fn async_closures_called_on_the_spot_stay_nested() {
+        for body in [
+            "(async || { load().await?; Ok(()) })().await?;\nOk(())",
+            "(|| async { load().await?; Ok(()) })().await?;\nOk(())",
+        ] {
+            let facts = facts_of(&subject(body));
+            assert_eq!(facts.obligations, [], "obligations of `{body}`");
+            assert!(facts.has_opaque_source, "opaque source of `{body}`");
+            let load = SymbolPath::parse("load").expect("valid path");
+            assert!(
+                facts.nested_callees.contains(&load),
+                "nested `load` of `{body}`"
+            );
+        }
+    }
+
+    #[test]
+    fn closures_run_elsewhere_stay_nested() {
+        let source_text = subject(
+            &[
+                "let h = std::thread::spawn(move || { store()?; Ok::<(), Error>(()) });",
+                "tokio::spawn(async move { flush().await?; Ok::<(), Error>(()) });",
+                "std::thread::scope(|scope| { scope.spawn(|| send()); load() })",
+            ]
+            .join("\n"),
+        );
+        let facts = facts_of(&source_text);
+        assert_eq!(obligations_of(&source_text), ["forward load"]);
+        for nested_callee in ["store", "flush", "send"] {
+            let path = SymbolPath::parse(nested_callee).expect("valid path");
+            assert!(facts.nested_callees.contains(&path), "`{nested_callee}`");
+        }
+    }
+
+    #[test]
+    fn method_forms_and_other_arguments_do_not_run_closures_in_place() {
+        let source_text = subject(
+            &[
+                "pool.scope(|s| { a()?; b() })?;",
+                "span.in_scope(|| { c()?; d() })?;",
+                "metrics::scope(\"name\", || { e()?; f() })?;",
+                "let body = |_| g();",
+                "std::thread::scope(body)?;",
+                "Ok(())",
+            ]
+            .join("\n"),
+        );
+        let facts = facts_of(&source_text);
+        assert_eq!(
+            obligations_of(&source_text),
+            [
+                "forward b|scope",
+                "forward d|in_scope",
+                "forward f|metrics::scope",
+                "forward g|std::thread::scope",
+            ]
+        );
+        for nested_callee in ["a", "c", "e"] {
+            let path = SymbolPath::parse(nested_callee).expect("valid path");
+            assert!(facts.nested_callees.contains(&path), "`{nested_callee}`");
+        }
+    }
+
+    #[test]
+    fn in_place_calls_under_error_adaptors_keep_their_question_marks_nested() {
+        let source_text = subject(
+            "std::thread::scope(|_| { a()?; b() }).context(\"c\")?;\n(|| { c()?; Ok(()) \
+             })().context(\"d\")?;\nOk(())",
+        );
+        let facts = facts_of(&source_text);
+        assert_eq!(obligations_of(&source_text), ["either b anyhow::Error"]);
+        assert!(facts.has_opaque_source);
+        for nested_callee in ["a", "c"] {
+            let path = SymbolPath::parse(nested_callee).expect("valid path");
+            assert!(facts.nested_callees.contains(&path), "`{nested_callee}`");
+        }
+    }
+
+    #[test]
+    fn possibly_recursive_self_calls_compose_with_error_adaptors_and_in_place_closures() {
+        let trait_impl = |body: &str| {
+            format!(
+                "impl Trait for S {{\n    fn subject(&self) -> Result<(), Error> {{\n{body}\n    \
+                 }}\n}}\n"
+            )
+        };
+        let self_subject = SymbolPath::parse("Self::subject").expect("valid path");
+        for body in [
+            "self.subject().map_err(Into::into)?;\nOk(())",
+            "Self::subject(self).inspect_err(report)",
+            "let r = self.subject().context(\"c\");\nr?;\nOk(())",
+            "let f = || Self::subject(self).with_context(|| \"c\");\nf()",
+            "std::thread::scope(|_| self.subject())",
+            "tokio::task::block_in_place(|| { Self::subject(self)?; Ok(()) })",
+            "let r = std::thread::scope(|_| Self::subject(self));\nr",
+            "(|| self.subject())()?;\nOk(())",
+        ] {
+            let source_text = trait_impl(body);
+            assert_eq!(
+                obligations_of(&source_text),
+                Vec::<String>::new(),
+                "`{body}`"
+            );
+            assert_eq!(
+                facts_of(&source_text).nested_callees,
+                HashSet::from([self_subject.clone()]),
+                "`{body}`"
+            );
+        }
+        for (body, obligation) in [
+            (
+                "Self::subject(self).context(\"c\")",
+                "either Self::subject anyhow::Error",
+            ),
+            (
+                "self.subject().map_err(Error::Wrap)",
+                "either Self::subject Error::Wrap",
+            ),
+            (
+                "std::thread::scope(|_| self.subject().with_context(|| \"c\"))",
+                "either Self::subject anyhow::Error",
+            ),
+        ] {
+            assert_eq!(obligations_of(&trait_impl(body)), [obligation], "`{body}`");
+        }
+    }
+
+    #[test]
+    fn let_closures_contribute_only_from_calls_in_a_return_position() {
+        let handled_closure = [
+            "let inner = |x: u32| -> anyhow::Result<()> { load(x)?; store(x) };",
+            "if inner(1).is_err() { tracing::warn!(\"first attempt failed\"); }",
+        ];
+        let source_text =
+            |tail: &[&str]| subject(&[&handled_closure[..], tail].concat().join("\n"));
+        assert_eq!(
+            obligations_of(&source_text(&["inner(2)?;", "other()"])),
+            ["forward store", "forward other"]
+        );
+        assert_eq!(
+            obligations_of(&source_text(&["other()"])),
+            ["forward other"]
+        );
     }
 }
